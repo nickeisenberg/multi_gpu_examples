@@ -9,10 +9,8 @@ from torch.distributed import init_process_group, destroy_process_group
 
 
 
-def ddp_setup(rank, world_size):
-    os.environ["MASTER_ADDR"] = "localhost"
-    os.environ["MASTER_PORT"] = "12345"
-    init_process_group(backend="nccl", rank=rank, world_size=world_size)
+def ddp_setup():
+    init_process_group(backend="nccl")
 
 
 class Trainer:
@@ -21,14 +19,28 @@ class Trainer:
                  train_loader: DataLoader,
                  loss_fn: nn.Module,
                  optimizer: torch.optim.Optimizer,
-                 gpu_id: int,
-                 save_every: int):
-        self.gpu_id = gpu_id
+                 save_every: int,
+                 snapshot_path: str):
+        
+        self.gpu_id = int(os.environ["LOCAL_RANK"])  # set by torchrun
+        self.model = model.to(self.gpu_id)
+
         self.train_loader = train_loader
         self.optimizer = optimizer
         self.loss_fn = loss_fn
         self.save_every = save_every
-        self.model = DDP(model, device_ids=[self.gpu_id])
+        self.epochs_run = 0
+
+        if os.path.exists(snapshot_path):
+            print("Loading snapshot")
+            self._load_snapshot(snapshot_path)
+
+        self.model = DDP(self.model, device_ids=[self.gpu_id])
+
+    def _load_snapshot(self, snapshot_path):
+        snapshot = torch.load(snapshot_path)
+        self.model.load_state_dict(snapshot["MODEL_STATE"])
+        self.epochs_run = snapshot["EPOCHS_RUN"]
 
     def _batch_pass(self, inputs, targets):
         self.optimizer.zero_grad()
@@ -43,16 +55,18 @@ class Trainer:
             inputs, targets = inputs.to(self.gpu_id), targets.to(self.gpu_id)
             self._batch_pass(inputs, targets)
 
-    def _save_checkpoint(self, epoch):
-        ckp = self.model.module.state_dict()
-        torch.save(ckp, "checkpoint.pt")
-        print(f"EPOCH {epoch} CHECKPOINT SAVED")
+    def _save_snapshot(self, epoch):
+        snapshot = {}
+        snapshot["MODEL_STATE"] = self.model.module.state_dict()
+        snapshot["EPOCHS_RUN"] = epoch
+        torch.save(snapshot, "snapshot.pt")
+        print(f"EPOCH {epoch} checkpoint saved at snapshot.pt")
 
     def train(self, max_epochs: int):
-        for epoch in range(1, max_epochs + 1):
+        for epoch in range(self.epochs_run, max_epochs + 1):
             self._run_epoch(epoch)
             if self.gpu_id == 0 and epoch % self.save_every == 0:
-                self._save_checkpoint(epoch)
+                self._save_snapshot(epoch)
 
 
 class RandomDataset(Dataset):
@@ -98,25 +112,23 @@ def format_dataloader(dataset: Dataset, batch_size: int):
     )
 
 
-def main(rank, world_size, total_epochs, save_every):
-    ddp_setup(rank, world_size)
+def main(total_epochs, save_every, snapshot_path: str = "snapshot.pt"):
+    ddp_setup()
     train_dataset, model, loss_fn, optimizer = load_train_objects()
-    model = model.to(rank)
     train_loader = format_dataloader(train_dataset, 32)
     trainer = Trainer(
         model=model, 
         train_loader=train_loader, 
         loss_fn=loss_fn, 
         optimizer=optimizer, 
-        gpu_id=rank, 
-        save_every=save_every
+        save_every=save_every,
+        snapshot_path=snapshot_path
     )
     trainer.train(total_epochs)
     destroy_process_group()
 
 
 if __name__ == "__main__":
-    total_epochs = 5
+    total_epochs = 50
     save_every = 1
-    world_size = torch.cuda.device_count()
-    mp.spawn(main, args=(world_size, total_epochs, save_every), nprocs=world_size)
+    main(total_epochs, save_every)
