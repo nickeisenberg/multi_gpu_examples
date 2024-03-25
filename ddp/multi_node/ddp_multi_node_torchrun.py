@@ -1,4 +1,5 @@
 import os
+import subprocess
 import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
@@ -6,7 +7,6 @@ import torch.multiprocessing as mp
 from torch.utils.data.distributed import DistributedSampler
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed import init_process_group, destroy_process_group
-
 
 
 def ddp_setup():
@@ -23,7 +23,7 @@ class Trainer:
                  snapshot_path: str):
         
         self.local_rank = int(os.environ["LOCAL_RANK"])  # set by torchrun
-        self.global_rank = int(os.environ["GLOBAL_RANK"])  # set by torchrun
+        self.global_rank = int(os.environ["RANK"])  # set by torchrun
 
         self.model = model.to(self.local_rank)
         self.model = DDP(self.model, device_ids=[self.local_rank])
@@ -40,6 +40,12 @@ class Trainer:
             self._load_snapshot(snapshot_path)
 
 
+        hostname = subprocess.run(
+            "echo $(hostname)", shell=True, stdout=subprocess.PIPE
+        ).stdout
+        self.hostname = hostname.decode().strip()
+
+
     def _load_snapshot(self, snapshot_path):
         snapshot = torch.load(snapshot_path)
         self.model.load_state_dict(snapshot["MODEL_STATE"])
@@ -53,7 +59,7 @@ class Trainer:
         self.optimizer.step()
 
     def _run_epoch(self, epoch):
-        print(f"GPU {self.local_rank} EPOCH {epoch}")
+        print(f"HOST {self.hostname} GPU {self.local_rank} EPOCH {epoch}")
         for inputs, targets in self.train_loader:
             inputs, targets = inputs.to(self.local_rank), targets.to(self.local_rank)
             self._batch_pass(inputs, targets)
